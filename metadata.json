@@ -1,0 +1,5 @@
+{
+  "name": "Bitki Soğuklama Takip",
+  "description": "Tarımda verimlilik yaratacak uygulamalar için meyve ağaçlarının soğuklama adı verilen, ağacın 7 santigrad derece sıcaklıkların altındaki sıcaklık derecelerine  ne kadar süre maruz kaldığını kamu meterolojisinin belirtilecek bölgelerdeki sıcaklık ölçümlerini gerçek zamanlı çekerek günlük aylık ve yıllık bazda kümülatif olarak tespit edecek ve grafik olarak çiftçeilere sunacak bir uygulama",
+  "requestFramePermissions": []
+}

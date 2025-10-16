@@ -122,6 +122,7 @@ const CHERRY_VARIETIES: Record<string, CherryVariety> = {
 };
 
 const AUTO_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const FROST_THRESHOLD_C = 0;
 
 // --- STATE MANAGEMENT ---
 
@@ -187,10 +188,10 @@ type AppState = {
       yearly?: Record<string, number>;
   } | null;
   trendChartError: string | null;
-  isSmsAlertsEnabled: boolean;
-  phoneNumber: string;
-  isEmailAlertsEnabled: boolean;
-  emailAddress: string;
+  isFrostForecastLoading: boolean;
+  frostForecastData: { time: string[]; temperature: number[] } | null;
+  frostForecastError: string | null;
+  isFrostWarningModalVisible: boolean;
 };
 
 function toSafeISOString(date: Date): string {
@@ -243,10 +244,10 @@ const state: AppState = {
   isTrendLoading: false,
   trendChartData: null,
   trendChartError: null,
-  isSmsAlertsEnabled: false,
-  phoneNumber: '',
-  isEmailAlertsEnabled: false,
-  emailAddress: '',
+  isFrostForecastLoading: false,
+  frostForecastData: null,
+  frostForecastError: null,
+  isFrostWarningModalVisible: false,
 };
 
 let temperatureChart: any | null = null;
@@ -254,7 +255,39 @@ let monthlyChillingChart: any | null = null;
 let yearlyComparisonChart: any | null = null;
 let hourlyAverageChart: any | null = null;
 let trendChart: any | null = null;
+let frostForecastChart: any | null = null;
 let autoRefreshTimerId: number | null = null;
+
+// --- NOTIFICATION HELPERS ---
+let notificationIdCounter = 0;
+const notificationTimeouts = new Map<number, number>();
+
+function addNotification(notification: Omit<Notification, 'id'>) {
+    const isDuplicate = state.notifications.some(n => n.title === notification.title && n.message === notification.message);
+    if (isDuplicate) return;
+
+    const id = notificationIdCounter++;
+    state.notifications.push({ ...notification, id });
+    rerenderApp();
+
+    const timeoutId = window.setTimeout(() => {
+        removeNotification(id);
+    }, 7000);
+    notificationTimeouts.set(id, timeoutId);
+}
+
+function removeNotification(id: number) {
+    if (notificationTimeouts.has(id)) {
+        clearTimeout(notificationTimeouts.get(id));
+        notificationTimeouts.delete(id);
+    }
+    
+    const notificationIndex = state.notifications.findIndex(n => n.id === id);
+    if (notificationIndex > -1) {
+        state.notifications.splice(notificationIndex, 1);
+        rerenderApp();
+    }
+}
 
 // --- DATA PROCESSING & API ---
 
@@ -312,6 +345,7 @@ async function fetchAndProcessWeatherData(options: { isManual: boolean }) {
     if (options.isManual) {
         state.aiRecommendation = null;
         state.totalChillingHours = null;
+        state.districtAverageTemperatures = null;
     }
     rerenderApp();
 
@@ -342,6 +376,11 @@ async function fetchAndProcessWeatherData(options: { isManual: boolean }) {
 
         // Case 1: The entire range is historical.
         if (endDateStr < todayStr) {
+             addNotification({
+                type: 'info',
+                title: 'Geçmiş Tarih Aralığı',
+                message: 'Seçtiğiniz tarih aralığı geçmişte kalmıştır. Gösterilen veriler historiktir ve otomatik olarak güncellenmeyecektir.'
+            });
             const apiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${startDateStr}&end_date=${endDateStr}&hourly=temperature_2m&timezone=auto`;
             const data = await fetchWeatherData(apiUrl);
             combinedHourlyData = data.hourly;
@@ -398,7 +437,8 @@ async function fetchAndProcessWeatherData(options: { isManual: boolean }) {
         state.chartEndDate = state.endDate;
 
         if (options.isManual) {
-            fetchAiRecommendation(); // This is non-blocking
+            fetchDistrictAverageTemperatures(); // Non-blocking
+            fetchAiRecommendation(); // Non-blocking
         }
 
     } catch (err: any) {
@@ -424,7 +464,13 @@ function stopAutoRefresh() {
 
 function startAutoRefresh() {
     stopAutoRefresh();
-    if (state.isAutoRefreshEnabled && state.totalChillingHours !== null) {
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = toSafeISOString(today);
+    const isHistorical = state.endDate < todayStr;
+
+    if (state.isAutoRefreshEnabled && state.totalChillingHours !== null && !isHistorical) {
         autoRefreshTimerId = window.setInterval(() => {
             fetchAndProcessWeatherData({ isManual: false });
         }, AUTO_REFRESH_INTERVAL_MS);
@@ -473,6 +519,131 @@ async function fetchYearlyComparisonData(): Promise<Record<string, number>> {
     return yearlyData;
 }
 
+async function fetchDistrictAverageTemperatures() {
+    state.isMapLoading = true;
+    state.districtAverageTemperatures = null;
+    rerenderApp();
+
+    try {
+        const districts = LOCATIONS[state.selectedProvince];
+        const startDateStr = state.startDate;
+        const endDateStr = state.endDate;
+        const districtNames = Object.keys(districts);
+
+        const promises = districtNames.map(async (districtName) => {
+            const location = districts[districtName];
+            const { lat, lon } = location;
+
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const todayStr = toSafeISOString(today);
+
+            const fetchWeatherData = async (url: string) => {
+                const response = await fetch(url);
+                if (!response.ok) return null;
+                return response.json();
+            };
+            
+            let hourlyTemps: number[] = [];
+
+            if (endDateStr < todayStr) { // Fully historical
+                const apiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${startDateStr}&end_date=${endDateStr}&hourly=temperature_2m&timezone=auto`;
+                const data = await fetchWeatherData(apiUrl);
+                if (data && data.hourly && data.hourly.temperature_2m) hourlyTemps = data.hourly.temperature_2m;
+            } else if (startDateStr < todayStr) { // Spans past and future
+                const yesterday = new Date(today);
+                yesterday.setDate(today.getDate() - 1);
+                const yesterdayStr = toSafeISOString(yesterday);
+                
+                const archiveApiUrl = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}&start_date=${startDateStr}&end_date=${yesterdayStr}&hourly=temperature_2m&timezone=auto`;
+                const forecastApiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&start_date=${todayStr}&end_date=${endDateStr}&hourly=temperature_2m&timezone=auto`;
+
+                 const [archiveData, forecastData] = await Promise.all([
+                    fetchWeatherData(archiveApiUrl),
+                    fetchWeatherData(forecastApiUrl)
+                ]);
+                
+                if (archiveData && archiveData.hourly && archiveData.hourly.temperature_2m) hourlyTemps.push(...archiveData.hourly.temperature_2m);
+                if (forecastData && forecastData.hourly && forecastData.hourly.temperature_2m) hourlyTemps.push(...forecastData.hourly.temperature_2m);
+
+            } else { // Fully future
+                const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&start_date=${startDateStr}&end_date=${endDateStr}&hourly=temperature_2m&timezone=auto`;
+                const data = await fetchWeatherData(apiUrl);
+                if (data && data.hourly && data.hourly.temperature_2m) hourlyTemps = data.hourly.temperature_2m;
+            }
+
+            if (hourlyTemps.length > 0) {
+                const totalTemp = hourlyTemps.reduce((sum, temp) => sum + (temp ?? 0), 0);
+                const tempCount = hourlyTemps.filter(t => t !== null).length;
+                if(tempCount > 0) return { districtName, avgTemp: totalTemp / tempCount };
+            }
+            return { districtName, avgTemp: null };
+        });
+
+        const results = await Promise.all(promises);
+        const avgTemps: Record<string, number> = {};
+        results.forEach(result => {
+            if (result.avgTemp !== null) {
+                avgTemps[result.districtName] = result.avgTemp;
+            }
+        });
+
+        if (Object.keys(avgTemps).length === 0) {
+             throw new Error("İlçeler için ortalama sıcaklık verisi alınamadı.");
+        }
+
+        state.districtAverageTemperatures = avgTemps;
+
+    } catch (err: any) {
+        console.error("Error fetching district average temperatures:", err);
+        state.districtAverageTemperatures = null;
+    } finally {
+        state.isMapLoading = false;
+        rerenderApp();
+    }
+}
+
+async function fetchFrostForecast(options: { isInitialLoad: boolean }) {
+    state.isFrostForecastLoading = true;
+    state.frostForecastError = null;
+    rerenderApp();
+
+    try {
+        const location = LOCATIONS[state.selectedProvince][state.selectedDistrict];
+        const { lat, lon } = location;
+        const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m&forecast_days=7&timezone=auto`;
+        
+        const response = await fetch(apiUrl);
+        if (!response.ok) {
+            throw new Error('Hava durumu tahmini alınamadı.');
+        }
+        const data = await response.json();
+        
+        if (!data.hourly || !data.hourly.time || !data.hourly.temperature_2m) {
+            throw new Error('Geçersiz tahmin verisi formatı.');
+        }
+
+        state.frostForecastData = {
+            time: data.hourly.time,
+            temperature: data.hourly.temperature_2m
+        };
+
+        const hasFrostRisk = data.hourly.temperature_2m.some((temp: number) => temp <= FROST_THRESHOLD_C);
+        
+        if (hasFrostRisk && options.isInitialLoad) {
+            state.isFrostWarningModalVisible = true;
+        }
+
+    } catch (err: any) {
+        state.frostForecastError = err.message || "Bilinmeyen bir hata oluştu.";
+        state.frostForecastData = null;
+    } finally {
+        state.isFrostForecastLoading = false;
+        rerenderApp();
+    }
+}
+
+
 function generatePrompt(): string {
     return `Seçilen konum (${state.selectedProvince} - ${state.selectedDistrict}) ve kiraz çeşidi (${state.selectedVariety}) için bir tarım danışmanı gibi davran. Toplam soğuklama saati: ${state.totalChillingHours || 'henüz hesaplanmadı'}, bu çeşit için gereken saat: ${CHERRY_VARIETIES[state.selectedVariety]?.requiredHours}. Bu bilgilere dayanarak, bu çeşidin bu konum için uygunluğunu değerlendir. Olası riskleri (örneğin, ilkbahar donları, yetersiz soğuklama) ve avantajları belirt. Çiftçiye somut önerilerde bulun. Cevabını Markdown formatında, başlıklar ve listeler kullanarak yapılandır.`;
 }
@@ -518,7 +689,7 @@ function h<K extends keyof (HTMLElementTagNameMap & SVGElementTagNameMap)>(
   props: ElementProps | null,
   ...children: (Node | string | null | undefined)[]
 ): (HTMLElementTagNameMap & SVGElementTagNameMap)[K] {
-  const el = (tag === 'svg' || tag === 'path')
+  const el = (tag === 'svg' || tag === 'path' || tag === 'polyline' || tag === 'line')
     ? document.createElementNS('http://www.w3.org/2000/svg', tag)
     : document.createElement(tag as keyof HTMLElementTagNameMap);
 
@@ -577,6 +748,121 @@ function renderVarietyInfoCard(): HTMLElement {
     );
 }
 
+function renderFrostForecastCard(): HTMLElement {
+    setTimeout(() => {
+        const ctx = (document.getElementById('frost-forecast-chart') as HTMLCanvasElement)?.getContext('2d');
+        if (!ctx || !state.frostForecastData) return;
+
+        if (frostForecastChart) {
+            frostForecastChart.destroy();
+        }
+
+        const pointColors = state.frostForecastData.temperature.map(temp => temp <= FROST_THRESHOLD_C ? '#ff5252' : 'rgba(0, 201, 255, 0.5)');
+        const pointRadii = state.frostForecastData.temperature.map(temp => temp <= FROST_THRESHOLD_C ? 4 : 0);
+
+        frostForecastChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: state.frostForecastData.time.map(t => new Date(t).toLocaleString('tr-TR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })),
+                datasets: [
+                    {
+                        label: 'Sıcaklık Tahmini (°C)',
+                        data: state.frostForecastData.temperature,
+                        borderColor: '#00c9ff',
+                        backgroundColor: 'rgba(0, 201, 255, 0.1)',
+                        tension: 0.3,
+                        fill: true,
+                        pointBackgroundColor: pointColors,
+                        pointRadius: pointRadii,
+                        pointHoverRadius: 6,
+                    },
+                    {
+                        label: `Don Eşiği (${FROST_THRESHOLD_C}°C)`,
+                        data: Array(state.frostForecastData.time.length).fill(FROST_THRESHOLD_C),
+                        borderColor: '#ff8a80',
+                        borderWidth: 2,
+                        borderDash: [5, 5],
+                        pointRadius: 0,
+                        fill: false,
+                    }
+                ]
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        ticks: {
+                            callback: function(value: number) { return value + '°C'; }
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        position: 'top',
+                    },
+                    tooltip: {
+                        callbacks: {
+                           label: function(context: any) {
+                               let label = context.dataset.label || '';
+                               if (label) {
+                                   label += ': ';
+                               }
+                               if (context.parsed.y !== null) {
+                                   label += context.parsed.y.toFixed(1) + '°C';
+                               }
+                               return label;
+                           }
+                        }
+                    }
+                }
+            }
+        });
+
+    }, 0);
+    
+    let content;
+    if (state.isFrostForecastLoading) {
+        content = div({ className: 'loader-container', style: 'min-height: 200px' },
+            div({ className: 'loader' }),
+            p(null, 'Tahmin verileri yükleniyor...')
+        );
+    } else if (state.frostForecastError) {
+        content = div({ className: 'error-card', style: 'margin: 1rem' },
+            p(null, state.frostForecastError)
+        );
+    } else if (state.frostForecastData) {
+        const frostEvents = state.frostForecastData.time
+            .map((time, index) => ({ time, temp: state.frostForecastData!.temperature[index] }))
+            .filter(d => d.temp <= FROST_THRESHOLD_C);
+
+        content = div(null,
+            div({ className: 'line-chart-card', style: 'height: 300px; margin-bottom: 1rem;' },
+                h('canvas', { id: 'frost-forecast-chart' })
+            ),
+            frostEvents.length > 0 ?
+                div({ className: 'frost-warning-list' },
+                    h4(null, 'Tespit Edilen Don Riski Zamanları'),
+                    ...frostEvents.map(event =>
+                        div({ className: 'frost-warning-item' },
+                            span(null, new Date(event.time).toLocaleString('tr-TR', { dateStyle: 'full', timeStyle: 'short' })),
+                            span(null, `${event.temp.toFixed(1)}°C`)
+                        )
+                    )
+                ) :
+                p({ style: 'text-align: center; color: var(--text-color-secondary); padding: 1rem;' }, 'Önümüzdeki 7 gün için zirai don riski beklenmemektedir.')
+        );
+    }
+
+    return div({ className: 'frost-forecast-card' },
+        h4({}, '1 Haftalık Zirai Don Tahmini'),
+        p({ className: 'prompt-description' }, 'Önümüzdeki 7 gün için saatlik sıcaklık tahminlerini ve potansiyel don risklerini görüntüleyin.'),
+        content,
+        button({ className: 'secondary-btn', style: 'width: 100%; margin-top: 1rem;', onclick: () => fetchFrostForecast({ isInitialLoad: false }) }, 'Tahmini Yenile')
+    );
+}
+
+
 function renderControlPanel(): HTMLElement {
     const provinceOptions = Object.keys(LOCATIONS).map(p => option({ value: p, selected: p === state.selectedProvince }, p));
     const districtOptions = Object.keys(LOCATIONS[state.selectedProvince]).map(d => option({ value: d, selected: d === state.selectedDistrict }, d));
@@ -619,60 +905,7 @@ function renderControlPanel(): HTMLElement {
         ),
         div({ className: 'tab-content' },
             div({ className: `tab-pane ${state.activeControlTab === 'alerts' ? 'active' : ''}` },
-                 div({className: 'alert-settings-group'},
-                    div({className: 'alert-settings-header'},
-                        h4({}, 'SMS ile Don Uyarısı'),
-                        label({className: 'toggle-switch'},
-                             input({ type: 'checkbox', checked: state.isSmsAlertsEnabled, onchange: handleSmsAlertsToggle }),
-                             span({className: 'slider'})
-                        )
-                    ),
-                    p({ className: 'prompt-description'}, 'Hava sıcaklığı donma noktasının altına düştüğünde telefonunuza uyarı gönderin.'),
-                    div({ className: `phone-input-container ${state.isSmsAlertsEnabled ? 'visible' : ''}`},
-                        div({className: 'control-group'},
-                            label({htmlFor: 'phone-input'}, 'Telefon Numarası'),
-                            input({
-                                id: 'phone-input',
-                                type: 'tel',
-                                placeholder: 'Örn: 5551234567',
-                                value: state.phoneNumber,
-                                oninput: handlePhoneNumberChange,
-                                disabled: !state.isSmsAlertsEnabled
-                            })
-                        )
-                    ),
-                     div({className: 'alert-disclaimer'},
-                         h('strong', null, 'Gelecek Özellik: '),
-                         'Bu fonksiyon şu anda geliştirme aşamasındadır ve aktif değildir. Gerçek SMS gönderimi yapılmamaktadır.'
-                     )
-                ),
-                div({className: 'alert-settings-group'},
-                    div({className: 'alert-settings-header'},
-                        h4({}, 'E-posta ile Don Uyarısı'),
-                        label({className: 'toggle-switch'},
-                             input({ type: 'checkbox', checked: state.isEmailAlertsEnabled, onchange: handleEmailAlertsToggle }),
-                             span({className: 'slider'})
-                        )
-                    ),
-                    p({ className: 'prompt-description'}, 'Hava sıcaklığı donma noktasının altına düştüğünde e-posta adresinize uyarı gönderin.'),
-                    div({ className: `email-input-container ${state.isEmailAlertsEnabled ? 'visible' : ''}`},
-                        div({className: 'control-group'},
-                            label({htmlFor: 'email-input'}, 'E-posta Adresi'),
-                            input({
-                                id: 'email-input',
-                                type: 'email',
-                                placeholder: 'ornek@eposta.com',
-                                value: state.emailAddress,
-                                oninput: handleEmailAddressChange,
-                                disabled: !state.isEmailAlertsEnabled
-                            })
-                        )
-                    ),
-                     div({className: 'alert-disclaimer'},
-                         h('strong', null, 'Gelecek Özellik: '),
-                         'Bu fonksiyon şu anda geliştirme aşamasındadır ve aktif değildir. Gerçek e-posta gönderimi yapılmamaktadır.'
-                     )
-                )
+                 renderFrostForecastCard()
             ),
             div({ className: `tab-pane ${state.activeControlTab === 'dataSource' ? 'active' : ''}`},
                  div({className: 'alert-settings-group data-source-group'},
@@ -881,7 +1114,29 @@ function renderDailyTemperatureChart(): HTMLElement {
     }, 0);
 
     return div({ id: 'daily-chart-section', className: 'card' },
-        div({ className: 'card-header' }, h2({}, 'Günlük Sıcaklık Değişimi')),
+        div({ className: 'card-header' },
+            h2({}, 'Günlük Sıcaklık Değişimi'),
+            div({ className: 'chart-date-filter' },
+                label({ htmlFor: 'chart-start-date' }, 'Grafik Başlangıç:'),
+                input({
+                    id: 'chart-start-date',
+                    type: 'date',
+                    value: state.chartStartDate,
+                    onchange: handleChartStartDateChange,
+                    min: state.startDate,
+                    max: state.chartEndDate
+                }),
+                label({ htmlFor: 'chart-end-date' }, 'Bitiş:'),
+                input({
+                    id: 'chart-end-date',
+                    type: 'date',
+                    value: state.chartEndDate,
+                    onchange: handleChartEndDateChange,
+                    min: state.chartStartDate,
+                    max: state.endDate
+                })
+            )
+        ),
         div({ className: 'line-chart-card' },
             h('canvas', { id: 'daily-temp-chart' })
         )
@@ -891,19 +1146,37 @@ function renderDailyTemperatureChart(): HTMLElement {
 function renderMonthlyChillingChart(): HTMLElement {
     setTimeout(() => {
         const ctx = (document.getElementById('monthly-chilling-chart') as HTMLCanvasElement)?.getContext('2d');
-        if (!ctx || !state.monthlyChillingHours) return;
+        if (!ctx || !state.monthlyChillingHours || !state.rawHourlyData) return;
 
         if (monthlyChillingChart) {
             monthlyChillingChart.destroy();
         }
         
+        const filteredMonthlyHours: Record<string, number> = {};
+        const chartStart = new Date(state.chartStartDate);
+        const chartEnd = new Date(state.chartEndDate);
+        chartEnd.setHours(23, 59, 59, 999); // Include the whole end day
+
+        const dataToProcess = state.rawHourlyData.filter(d => {
+            const itemDate = new Date(d.timestamp);
+            return itemDate >= chartStart && itemDate <= chartEnd;
+        });
+
+        for (const item of dataToProcess) {
+            if (item.temperature <= state.chillingThreshold) {
+                const date = new Date(item.timestamp);
+                const monthKey = date.toLocaleString('tr-TR', { year: 'numeric', month: 'long' });
+                filteredMonthlyHours[monthKey] = (filteredMonthlyHours[monthKey] || 0) + 1;
+            }
+        }
+        
         monthlyChillingChart = new Chart(ctx, {
             type: 'bar',
             data: {
-                labels: Object.keys(state.monthlyChillingHours),
+                labels: Object.keys(filteredMonthlyHours),
                 datasets: [{
                     label: 'Soğuklama Saati',
-                    data: Object.values(state.monthlyChillingHours),
+                    data: Object.values(filteredMonthlyHours),
                     backgroundColor: 'rgba(0, 242, 169, 0.5)',
                     borderColor: 'rgba(0, 242, 169, 1)',
                     borderWidth: 1
@@ -924,7 +1197,11 @@ function renderMonthlyChillingChart(): HTMLElement {
 function renderDailyDetailsTable(): HTMLElement {
     if (!state.dailyTemperatures) return div(null);
 
-    const tableRows = state.dailyTemperatures.map(day =>
+    const filteredData = state.dailyTemperatures.filter(day =>
+        day.date >= state.chartStartDate && day.date <= state.chartEndDate
+    );
+
+    const tableRows = filteredData.map(day =>
         h('tr', null,
             h('td', { 'data-label': 'Tarih' }, new Date(day.date).toLocaleDateString('tr-TR')),
             h('td', { 'data-label': 'Min Sıcaklık' }, `${day.min.toFixed(1)}°C`),
@@ -933,7 +1210,18 @@ function renderDailyDetailsTable(): HTMLElement {
     );
 
     return div({ id: 'daily-details-section', className: 'card' },
-        div({ className: 'card-header' }, h2({}, 'Günlük Detaylar')),
+        div({ className: 'card-header' },
+            h2({}, 'Günlük Detaylar'),
+            button({ className: 'secondary-btn', onclick: downloadCsv, title: 'Verileri CSV olarak indir' },
+                // Download SVG Icon
+                h('svg', { xmlns: "http://www.w3.org/2000/svg", width: "18", height: "18", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", className: 'btn-icon'},
+                    h('path', { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }),
+                    h('polyline', { points: "7 10 12 15 17 10" }),
+                    h('line', { x1: "12", y1: "15", x2: "12", y2: "3" })
+                ),
+                'CSV İndir'
+            )
+        ),
         div({ className: 'temp-table-container' },
             h('table', { className: 'temp-table' },
                 h('thead', null,
@@ -945,6 +1233,52 @@ function renderDailyDetailsTable(): HTMLElement {
                 ),
                 h('tbody', null, ...tableRows)
             )
+        )
+    );
+}
+
+function getTemperatureColor(temp: number, minTemp: number, maxTemp: number): string {
+    if (minTemp === maxTemp) return 'hsl(180, 80%, 50%)'; // A neutral teal if all temps are the same
+
+    const normalized = (temp - minTemp) / (maxTemp - minTemp);
+    const hue = 240 - (normalized * 240);
+    
+    return `hsl(${hue}, 90%, 60%)`;
+}
+
+function renderMapCard(): HTMLElement | null {
+    if (state.isMapLoading) {
+        return div({ className: 'card' },
+            div({ className: 'loader-container' },
+                div({ className: 'loader' }),
+                p(null, 'İlçe sıcaklık haritası oluşturuluyor...')
+            )
+        );
+    }
+
+    if (!state.districtAverageTemperatures || Object.keys(state.districtAverageTemperatures).length === 0) {
+        return null; // Don't render if no data
+    }
+
+    const temps = Object.values(state.districtAverageTemperatures);
+    const minTemp = Math.min(...temps);
+    const maxTemp = Math.max(...temps);
+
+    const districtItems = Object.entries(state.districtAverageTemperatures).map(([district, temp]) => {
+        const color = getTemperatureColor(temp, minTemp, maxTemp);
+        return div({ className: 'map-district-item', style: `background-color: ${color}` },
+            div({ className: 'map-district-name' }, district),
+            div({ className: 'map-district-temp' }, `${temp.toFixed(1)}°C`)
+        );
+    });
+
+    return div({ className: 'card map-card' },
+        h4(null, `${state.selectedProvince} - Ortalama Sıcaklık Dağılımı`),
+        div({ className: 'map-grid' }, ...districtItems),
+        div({ className: 'map-legend' },
+            span({ className: 'legend-label' }, `${minTemp.toFixed(1)}°C`),
+            div({ className: 'map-legend-gradient' }),
+            span({ className: 'legend-label' }, `${maxTemp.toFixed(1)}°C`)
         )
     );
 }
@@ -1001,18 +1335,41 @@ function renderTrendChart(): HTMLElement {
     );
 }
 
+function renderFrostWarningModal(): HTMLElement {
+    return div({ className: `modal-backdrop ${state.isFrostWarningModalVisible ? 'active' : ''}` },
+        div({ className: 'modal-container' },
+            div({ className: 'modal-header' },
+                h2(null, 'Zirai Don Uyarısı'),
+                button({ className: 'modal-close-btn', onclick: () => { state.isFrostWarningModalVisible = false; rerenderApp(); } },
+                     h('svg', { xmlns: "http://www.w3.org/2000/svg", width: "24", height: "24", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round"},
+                         h('line', { x1: "18", y1: "6", x2: "6", y2: "18" }),
+                         h('line', { x1: "6", y1: "6", x2: "18", y2: "18" })
+                     )
+                )
+            ),
+            div({ className: 'modal-content' },
+                p(null, `Dikkat! Seçili konum olan ${state.selectedDistrict} için önümüzdeki 7 gün içinde sıcaklığın ${FROST_THRESHOLD_C}°C veya altına düşmesi beklenmektedir.`),
+                p(null, 'Detaylı saatlik tahminler için "Uyarılar" sekmesini kontrol etmeniz ve gerekli önlemleri almanız önerilir.')
+            )
+        )
+    );
+}
+
 
 // --- EVENT HANDLERS ---
 function handleProvinceChange(e: Event) {
     const target = e.target as HTMLSelectElement;
     state.selectedProvince = target.value;
     state.selectedDistrict = Object.keys(LOCATIONS[state.selectedProvince])[0];
+    state.districtAverageTemperatures = null;
+    fetchFrostForecast({ isInitialLoad: false }); // Update frost forecast for new province
     rerenderApp();
 }
 
 function handleDistrictChange(e: Event) {
     const target = e.target as HTMLSelectElement;
     state.selectedDistrict = target.value;
+    fetchFrostForecast({ isInitialLoad: false }); // Update frost forecast for new district
     rerenderApp();
 }
 
@@ -1025,36 +1382,6 @@ function handleVarietyChange(e: Event) {
 function handleDataSourceChange(e: Event) {
     const target = e.target as HTMLInputElement;
     state.dataSource = target.value as 'open-meteo' | 'gemini';
-    rerenderApp();
-}
-
-function handleSmsAlertsToggle(e: Event) {
-    const target = e.target as HTMLInputElement;
-    state.isSmsAlertsEnabled = target.checked;
-    if (!state.isSmsAlertsEnabled) {
-        state.phoneNumber = ''; // Clear phone number when disabled
-    }
-    rerenderApp();
-}
-
-function handlePhoneNumberChange(e: Event) {
-    const target = e.target as HTMLInputElement;
-    state.phoneNumber = target.value.replace(/[^0-9]/g, ''); // Only allow numbers
-    rerenderApp();
-}
-
-function handleEmailAlertsToggle(e: Event) {
-    const target = e.target as HTMLInputElement;
-    state.isEmailAlertsEnabled = target.checked;
-    if (!state.isEmailAlertsEnabled) {
-        state.emailAddress = ''; // Clear email address when disabled
-    }
-    rerenderApp();
-}
-
-function handleEmailAddressChange(e: Event) {
-    const target = e.target as HTMLInputElement;
-    state.emailAddress = target.value;
     rerenderApp();
 }
 
@@ -1084,6 +1411,18 @@ function handleEndDateChange(e: Event) {
 function handleThresholdChange(e: Event) {
     const target = e.target as HTMLInputElement;
     state.chillingThreshold = parseFloat(target.value) || 7.2;
+    rerenderApp();
+}
+
+function handleChartStartDateChange(e: Event) {
+    const target = e.target as HTMLInputElement;
+    state.chartStartDate = target.value;
+    rerenderApp();
+}
+
+function handleChartEndDateChange(e: Event) {
+    const target = e.target as HTMLInputElement;
+    state.chartEndDate = target.value;
     rerenderApp();
 }
 
@@ -1135,10 +1474,76 @@ async function handleTrendButtonClick(trend: 'daily' | 'monthly' | 'yearly') {
     }
 }
 
+function downloadCsv() {
+    if (!state.dailyTemperatures) {
+        console.error("İndirilecek veri bulunamadı.");
+        return;
+    }
+
+    const filteredData = state.dailyTemperatures.filter(day =>
+        day.date >= state.chartStartDate && day.date <= state.chartEndDate
+    );
+
+    const headers = ["Tarih", "Min Sıcaklık (°C)", "Maks Sıcaklık (°C)"];
+
+    let csvContent = headers.join(",") + "\n";
+    filteredData.forEach(day => {
+        const rowArray = [
+            new Date(day.date).toLocaleDateString('tr-TR'),
+            day.min.toFixed(1),
+            day.max.toFixed(1)
+        ];
+        csvContent += rowArray.join(",") + "\n";
+    });
+
+    // BOM for UTF-8 Excel compatibility
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+
+    const safeFileName = `${state.selectedProvince}_${state.selectedDistrict}_${state.endDate}`.replace(/[^a-z0-9_.-]/gi, '_');
+    link.setAttribute("download", `sicaklik_verileri_${safeFileName}.csv`);
+    
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+function renderNotifications() {
+    const container = document.getElementById('notification-container');
+    if (!container) return;
+    container.innerHTML = '';
+
+    state.notifications.forEach(notification => {
+        const contentWrapper = div({},
+            h4({ className: 'notification-title' }, notification.title),
+            p({ className: 'notification-message' }, notification.message)
+        );
+
+        const closeButton = button({
+            className: 'notification-close-btn',
+            onclick: () => removeNotification(notification.id),
+            title: 'Kapat'
+        }, '×');
+
+        const notificationEl = div({
+            id: `notification-${notification.id}`,
+            className: `notification ${notification.type}`
+        }, contentWrapper, closeButton);
+        
+        container.appendChild(notificationEl);
+    });
+}
 
 // --- APP ---
 function App() {
     return div(null,
+        renderFrostWarningModal(),
         h('header', null,
             h1(null, 'Bitki Soğuklama Takip'),
             p(null, 'Meyve ağaçlarınızın soğuklama ihtiyacını takip edin ve tarımsal verimliliğinizi artırın.')
@@ -1161,6 +1566,7 @@ function App() {
                     state.error ? renderErrorCard(state.error) : null,
                     state.totalChillingHours !== null ? renderResultsSummary() : null,
                     renderAiRecommendationCard(),
+                    renderMapCard(),
                     state.dailyTemperatures ? renderDailyTemperatureChart() : null,
                     state.monthlyChillingHours ? renderMonthlyChillingChart() : null,
                     state.dailyTemperatures ? renderDailyDetailsTable() : null
@@ -1178,7 +1584,11 @@ function rerenderApp() {
         root.appendChild(App());
         root.scrollTop = scrollTop;
     }
+    renderNotifications();
 }
 
 // Initial Render
-document.addEventListener('DOMContentLoaded', rerenderApp);
+document.addEventListener('DOMContentLoaded', () => {
+    rerenderApp();
+    fetchFrostForecast({ isInitialLoad: true });
+});

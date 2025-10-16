@@ -306,6 +306,7 @@ textarea {
     font-weight: 500;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 0.5rem;
 }
 
@@ -319,7 +320,7 @@ textarea {
     flex-shrink: 0;
 }
 
-/* --- DATA SOURCE & SMS ALERT STYLES --- */
+/* --- DATA SOURCE & ALERT STYLES --- */
 .alert-settings-group {
     width: 100%;
     padding: 1rem;
@@ -379,33 +380,47 @@ textarea {
     cursor: pointer;
 }
 
-.phone-input-container,
-.email-input-container {
-    margin-top: 1rem;
-    opacity: 0;
-    height: 0;
-    overflow: hidden;
-    transition: opacity 0.4s ease, height 0.4s ease, margin-top 0.4s ease;
-}
-.phone-input-container.visible,
-.email-input-container.visible {
-    opacity: 1;
-    height: auto;
-    margin-top: 1rem;
-}
-.alert-disclaimer {
-    margin-top: 1rem;
-    font-size: 0.85rem;
-    color: var(--text-color-secondary);
-    background-color: rgba(255, 193, 7, 0.1);
-    border-left: 3px solid var(--warning-color);
-    padding: 0.75rem;
-    border-radius: 4px;
-}
-.alert-disclaimer strong {
-    color: var(--warning-color);
+/* --- FROST FORECAST CARD --- */
+.frost-forecast-card {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1rem;
 }
 
+.frost-forecast-card h4 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.1rem;
+    color: var(--primary-color);
+}
+
+.frost-forecast-card .prompt-description {
+    margin-bottom: 1rem;
+}
+
+.frost-warning-list {
+    margin-top: 1rem;
+    max-height: 150px;
+    overflow-y: auto;
+    border-top: 1px solid var(--border-color);
+    padding-top: 1rem;
+}
+
+.frost-warning-list h4 {
+    font-size: 1rem;
+    color: var(--warning-color);
+    margin-bottom: 0.5rem;
+}
+
+.frost-warning-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.5rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+.frost-warning-item:nth-child(odd) {
+    background-color: rgba(255, 255, 255, 0.03);
+}
 
 /* --- TREND CONTROLS --- */
 .trend-controls-container {
@@ -831,10 +846,6 @@ textarea {
     align-items: center;
     gap: 0.5rem;
     flex-wrap: wrap;
-    padding: 0.5rem;
-    background-color: #2a2a2a;
-    border-radius: 8px;
-    justify-content: center;
 }
 
 .chart-date-filter label {
@@ -844,7 +855,7 @@ textarea {
 }
 
 .chart-date-filter input[type="date"] {
-    background-color: var(--surface-color);
+    background-color: #2a2a2a;
     border: 1px solid var(--border-color);
     padding: 0.4rem 0.6rem;
     border-radius: 6px;
@@ -1082,7 +1093,9 @@ textarea {
     background-color: var(--surface-color);
     border-radius: 12px;
     width: 90%;
-    max-width: 800px;
+    max-width: 500px;
+    border: 1px solid var(--border-color);
+    border-top: 4px solid var(--warning-color);
     box-shadow: 0 5px 25px rgba(0,0,0,0.5);
     transform: scale(0.95);
     transition: transform 0.3s;
@@ -1101,6 +1114,7 @@ textarea {
 
 .modal-header h2 {
     font-size: 1.4rem;
+    color: var(--warning-color);
 }
 
 .modal-close-btn {
@@ -1117,6 +1131,12 @@ textarea {
 
 .modal-content {
     padding: 1.5rem;
+    color: var(--text-color-secondary);
+    line-height: 1.7;
+}
+
+.modal-content p {
+    margin-bottom: 1rem;
 }
 
 .chart-description {
